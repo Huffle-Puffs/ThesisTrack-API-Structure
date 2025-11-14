@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Query
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from sentence_transformers import SentenceTransformer, util
 import torch
@@ -12,14 +12,24 @@ import json
 import docx
 from io import BytesIO
 import os
+import logging
+from typing import Dict, List, Optional
 
 # ====================
-# Load models with lazy loading
+# Configuration & Logging
 # ====================
-MODEL_DIR = Path(r"C:\xampp\htdocs\PyProj\flan_t5_finetuned_final")
-print("🔄 Loading your fine-tuned Flan-T5 model from:", MODEL_DIR)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Global variables with lazy loading
+# Configuration
+MODEL_NAME = "Hufflez/flan_t5_finetuned_final"
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+SUPPORTED_EXTENSIONS = {'.pdf', '.docx', '.doc'}
+
+# ====================
+# Load models with error handling and caching
+# ====================
 _tokenizer = None
 _model = None
 _embed_model = None
@@ -27,26 +37,44 @@ _nlp = None
 _device = None
 
 def get_models():
-    """Lazy load models when needed"""
+    """Lazy load models when needed with proper error handling"""
     global _tokenizer, _model, _embed_model, _nlp, _device
     
     if _tokenizer is None:
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
-        _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR, local_files_only=True)
-        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-        _device = "cuda" if torch.cuda.is_available() else "cpu"
-        _model = _model.to(_device)
-        
-        # Load spaCy for better text processing
         try:
-            _nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            print("⚠️  spaCy model not found, using basic tokenization")
-            _nlp = None
+            logger.info("🔄 Loading models...")
+            
+            # Load tokenizer and model from Hugging Face
+            _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+            _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+            
+            # Load embedding model
+            _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+            
+            # Determine device
+            _device = "cuda" if torch.cuda.is_available() else "cpu"
+            _model = _model.to(_device)
+            
+            # Load spaCy for better text processing
+            try:
+                _nlp = spacy.load("en_core_web_sm")
+            except OSError:
+                logger.warning("⚠️ spaCy model not found, using basic tokenization")
+                _nlp = None
+            
+            logger.info(f"✅ Models loaded successfully on device: {_device}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load models: {e}")
+            raise HTTPException(status_code=500, detail=f"Model loading failed: {str(e)}")
     
     return _tokenizer, _model, _embed_model, _nlp, _device
 
-app = FastAPI(title="Thesis Completeness & Relevance API")
+app = FastAPI(
+    title="Thesis Completeness & Relevance API",
+    description="API for analyzing thesis document completeness and section relevance",
+    version="1.0.0"
+)
 
 # ====================
 # Pre-compiled Regex Patterns
@@ -124,7 +152,6 @@ CHAPTER_REGEX_PATTERNS = {
         re.compile(r'^\s*SPECIFIC\s+OBJECTIVES?\s*:\s*$', re.IGNORECASE),
         re.compile(r'^\s*[IVXLCDM]+\.\s*SPECIFIC\s+OBJECTIVES?\s*$', re.IGNORECASE),
     ],
-    # ... (similar pre-compilation for all other sections)
     "Description of Respondents": [
         re.compile(r'^\s*DESCRIPTION\s+OF\s+RESPONDENTS\s*$', re.IGNORECASE),
         re.compile(r'^\s*RESPONDENTS\s*$', re.IGNORECASE),
@@ -138,7 +165,6 @@ CHAPTER_REGEX_PATTERNS = {
         re.compile(r'^\s*DESCRIPTION\s+OF\s+RESPONDENTS\s*\.?$', re.IGNORECASE),
         re.compile(r'^\s*4\.?\s*DESCRIPTION\s+OF\s+RESPONDENTS\s*$', re.IGNORECASE),
     ],
-    # ... (add all other sections with pre-compiled patterns)
 }
 
 # Pre-compile common regex patterns
@@ -220,23 +246,27 @@ def filter_content(content: str) -> str:
 # ====================
 def extract_pdf_text(pdf_path: Path) -> list:
     """Optimized PDF text extraction"""
-    doc = fitz.open(pdf_path)
-    all_lines = []
-    
-    for page in doc:
-        page_text = page.get_text("text")
-        lines = page_text.splitlines()
+    try:
+        doc = fitz.open(pdf_path)
+        all_lines = []
         
-        for line in lines:
-            line = line.strip()
-            if clean_line(line):
-                line = COMMON_REGEX['multiple_spaces'].sub(' ', line)
-                line = COMMON_REGEX['bullet_points'].sub('', line)
-                if len(line) >= 3:
-                    all_lines.append(line)
-    
-    doc.close()
-    return all_lines
+        for page in doc:
+            page_text = page.get_text("text")
+            lines = page_text.splitlines()
+            
+            for line in lines:
+                line = line.strip()
+                if clean_line(line):
+                    line = COMMON_REGEX['multiple_spaces'].sub(' ', line)
+                    line = COMMON_REGEX['bullet_points'].sub('', line)
+                    if len(line) >= 3:
+                        all_lines.append(line)
+        
+        doc.close()
+        return all_lines
+    except Exception as e:
+        logger.error(f"Error extracting PDF text: {e}")
+        raise HTTPException(status_code=400, detail=f"PDF extraction failed: {str(e)}")
 
 def extract_docx_text_enhanced(docx_path: Path) -> list:
     """Optimized Word document text extraction"""
@@ -283,11 +313,11 @@ def extract_docx_text_enhanced(docx_path: Path) -> list:
                         if len(line) >= 3:
                             all_lines.append(f"TABLE: {line}")
         
-        print(f"📄 Extracted {len(all_lines)} lines from Word document")
+        logger.info(f"📄 Extracted {len(all_lines)} lines from Word document")
         return all_lines
     except Exception as e:
-        print(f"❌ Error extracting Word document: {e}")
-        return []
+        logger.error(f"Error extracting Word document: {e}")
+        raise HTTPException(status_code=400, detail=f"Word document extraction failed: {str(e)}")
 
 def extract_document_text(file_path: Path, file_extension: str) -> list:
     """Extract text from PDF or Word documents"""
@@ -296,7 +326,7 @@ def extract_document_text(file_path: Path, file_extension: str) -> list:
     elif file_extension.lower() in ['.docx', '.doc']:
         return extract_docx_text_enhanced(file_path)
     else:
-        raise ValueError(f"Unsupported file format: {file_extension}")
+        raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_extension}")
 
 # ====================
 # Optimized Document Formatting Analysis
@@ -331,7 +361,7 @@ def analyze_document_formatting(file_path: Path, file_extension: str) -> dict:
         })
         
     except Exception as e:
-        print(f"⚠️ Formatting analysis error: {e}")
+        logger.warning(f"Formatting analysis error: {e}")
         formatting_info["error"] = str(e)
     
     return formatting_info
@@ -381,7 +411,7 @@ def predict_relevance(section: str, content: str) -> str:
                     relevance_votes.append("0")
                     
         except Exception as e:
-            print(f"⚠️ Model prediction error for {section}: {e}")
+            logger.warning(f"Model prediction error for {section}: {e}")
             relevance_votes.append("1")  # Benefit of doubt on error
     
     positive_votes = relevance_votes.count("1")
@@ -463,7 +493,7 @@ def find_sections_enhanced(lines: list, target_sections: list) -> dict:
                 if section not in section_positions:
                     section_positions[section] = []
                 section_positions[section].append(i)
-                print(f"✅ Found '{section}' at line {i}: '{clean_line.strip()}'")
+                logger.info(f"✅ Found '{section}' at line {i}: '{clean_line.strip()}'")
     
     return section_positions
 
@@ -473,7 +503,7 @@ def find_sections_enhanced(lines: list, target_sections: list) -> dict:
 def extract_general_objectives_special(lines: list, start_idx: int) -> str:
     """Optimized extraction for General Objectives"""
     
-    print(f"🎯 Starting specialized extraction for General Objectives at line {start_idx}")
+    logger.info(f"🎯 Starting specialized extraction for General Objectives at line {start_idx}")
     
     content_lines = []
     current_idx = start_idx + 1
@@ -513,13 +543,13 @@ def extract_general_objectives_special(lines: list, start_idx: int) -> str:
     if not content_text:
         content_text = extract_general_objectives_alternative(lines, start_idx)
     
-    print(f"📝 Extracted {len(content_text.split())} words for General Objectives")
+    logger.info(f"📝 Extracted {len(content_text.split())} words for General Objectives")
     return content_text
 
 def extract_general_objectives_alternative(lines: list, start_idx: int) -> str:
     """Alternative extraction method for General Objectives"""
     
-    print("🔄 Using alternative extraction for General Objectives")
+    logger.info("🔄 Using alternative extraction for General Objectives")
     
     # Method 1: Look for bullet points or numbered lists
     bullet_content = []
@@ -751,8 +781,8 @@ def filter_content_by_section(content: str, section: str) -> str:
 def extract_sections_with_targets(lines: list, target_sections: list, chapter: str = "Chapter 1") -> dict:
     """Optimized extraction for specific target sections"""
     
-    print(f"🎯 Using target sections extraction for {chapter}")
-    print(f"📋 Target sections ({len(target_sections)}): {target_sections}")
+    logger.info(f"🎯 Using target sections extraction for {chapter}")
+    logger.info(f"📋 Target sections ({len(target_sections)}): {target_sections}")
     
     result = {}
     
@@ -768,11 +798,11 @@ def extract_sections_with_targets(lines: list, target_sections: list, chapter: s
     # Sort by position
     all_section_occurrences.sort(key=lambda x: x[0])
     
-    print(f"📊 Found {len(all_section_occurrences)} section occurrences from {len(target_sections)} target sections")
+    logger.info(f"📊 Found {len(all_section_occurrences)} section occurrences from {len(target_sections)} target sections")
     
     # If no sections found with regex, try fuzzy matching as fallback
     if not all_section_occurrences:
-        print(f"🔄 No sections found with REGEX, trying fuzzy matching fallback...")
+        logger.info(f"🔄 No sections found with REGEX, trying fuzzy matching fallback...")
         return extract_sections_with_fuzzy_fallback(lines, target_sections, chapter)
     
     # Extract content for each section using enhanced method
@@ -798,7 +828,7 @@ def extract_sections_with_targets(lines: list, target_sections: list, chapter: s
                 "detection_method": "regex",
                 "position": current_pos
             }
-            print(f"📝 Extracted {len(content_text.split())} words for '{current_section}'")
+            logger.info(f"📝 Extracted {len(content_text.split())} words for '{current_section}'")
         else:
             result[current_section] = {
                 "content": "",
@@ -806,7 +836,7 @@ def extract_sections_with_targets(lines: list, target_sections: list, chapter: s
                 "detection_method": "regex_no_content",
                 "position": current_pos
             }
-            print(f"⚠️  Minimal content for '{current_section}'")
+            logger.info(f"⚠️  Minimal content for '{current_section}'")
     
     # Handle missing target sections
     for section in target_sections:
@@ -816,13 +846,13 @@ def extract_sections_with_targets(lines: list, target_sections: list, chapter: s
                 "children": {},
                 "detection_method": "not_found"
             }
-            print(f"❌ Target section '{section}' not found")
+            logger.info(f"❌ Target section '{section}' not found")
     
     return result
 
 def extract_sections_with_fuzzy_fallback(lines: list, target_sections: list, chapter: str) -> dict:
     """Optimized fuzzy matching fallback"""
-    print(f"🔧 Using fuzzy matching fallback for {len(target_sections)} target sections")
+    logger.info(f"🔧 Using fuzzy matching fallback for {len(target_sections)} target sections")
     
     result = {}
     
@@ -840,7 +870,7 @@ def extract_sections_with_fuzzy_fallback(lines: list, target_sections: list, cha
                 best_match_pos = i
         
         if best_match_pos != -1:
-            print(f"✅ FUZZY Found '{section}' at line {best_match_pos} (score: {best_match_score})")
+            logger.info(f"✅ FUZZY Found '{section}' at line {best_match_pos} (score: {best_match_score})")
             
             # Extract content using enhanced method
             content_text = extract_content_for_section_enhanced(lines, best_match_pos, section, target_sections)
@@ -851,14 +881,14 @@ def extract_sections_with_fuzzy_fallback(lines: list, target_sections: list, cha
                 "detection_method": "fuzzy",
                 "match_score": best_match_score
             }
-            print(f"📝 Extracted {len(content_text.split())} words for '{section}'")
+            logger.info(f"📝 Extracted {len(content_text.split())} words for '{section}'")
         else:
             result[section] = {
                 "content": "",
                 "children": {},
                 "detection_method": "not_found"
             }
-            print(f"❌ Target section '{section}' not found with fuzzy matching")
+            logger.info(f"❌ Target section '{section}' not found with fuzzy matching")
     
     return result
 
@@ -895,7 +925,7 @@ def filter_target_sections_by_enabled(target_sections: list, enabled_sections: l
     # Filter to only include sections that are enabled
     filtered_sections = [section for section in target_sections if section in enabled_sections]
     
-    print(f"🎯 Filtered sections: {len(filtered_sections)} enabled out of {len(target_sections)} total")
+    logger.info(f"🎯 Filtered sections: {len(filtered_sections)} enabled out of {len(target_sections)} total")
     return filtered_sections
 
 def get_all_possible_sections() -> list:
@@ -904,6 +934,23 @@ def get_all_possible_sections() -> list:
     for chapter_sections in CHAPTERS.values():
         all_sections.extend(chapter_sections)
     return list(set(all_sections))
+
+# ====================
+# File Validation & Security
+# ====================
+def validate_file(file: UploadFile) -> str:
+    """Validate uploaded file"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    
+    file_extension = Path(file.filename).suffix.lower()
+    if file_extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported file format. Supported formats: {', '.join(SUPPORTED_EXTENSIONS)}"
+        )
+    
+    return file_extension
 
 # ====================
 # Optimized API Endpoints
@@ -918,7 +965,10 @@ async def analyze_pdf(
 ):
     """Optimized PDF or Word document analysis"""
     
-    print(f"🎯 Received request for chapter: {chapter}")
+    logger.info(f"🎯 Received request for chapter: {chapter}")
+
+    # Validate file
+    file_extension = validate_file(file)
 
     # Parse enabled sections if provided
     enabled_sections_list = []
@@ -927,9 +977,9 @@ async def analyze_pdf(
             enabled_sections_list = json.loads(enabled_sections)
             if not isinstance(enabled_sections_list, list):
                 enabled_sections_list = []
-            print(f"🎯 Received {len(enabled_sections_list)} enabled sections from coordinator panel")
+            logger.info(f"🎯 Received {len(enabled_sections_list)} enabled sections from coordinator panel")
         except Exception as e:
-            print(f"⚠️ Error parsing enabled_sections, using all sections: {e}")
+            logger.warning(f"Error parsing enabled_sections, using all sections: {e}")
             enabled_sections_list = []
 
     # Get target sections based on enabled sections
@@ -938,44 +988,30 @@ async def analyze_pdf(
     if enabled_sections_list:
         target_sections = filter_target_sections_by_enabled(default_target_sections, enabled_sections_list)
         if not target_sections:
-            print("⚠️ No enabled sections match the chapter, using all default sections")
+            logger.warning("No enabled sections match the chapter, using all default sections")
             target_sections = default_target_sections
     else:
         target_sections = default_target_sections
     
-    print(f"📋 Final target sections for analysis: {len(target_sections)} sections")
-
-    # File type validation
-    file_extension = None
-    if file.filename:
-        filename_lower = file.filename.lower()
-        if filename_lower.endswith(".pdf"):
-            file_extension = '.pdf'
-        elif filename_lower.endswith(".docx"):
-            file_extension = '.docx'
-        elif filename_lower.endswith(".doc"):
-            file_extension = '.doc'
-
-    if not file_extension:
-        return {
-            "error": "Unsupported file format",
-            "supported_formats": ["PDF", "DOCX", "DOC"],
-            "status": "error"
-        }
+    logger.info(f"📋 Final target sections for analysis: {len(target_sections)} sections")
 
     # Save uploaded file temporarily
-    pdf_path = Path(f"temp_{file.filename}")
-    pdf_path.parent.mkdir(exist_ok=True)
-    with open(pdf_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-
-    print(f"📄 Saved uploaded file: {len(content)} bytes, type: {file_extension}")
-
+    temp_dir = Path("temp_uploads")
+    temp_dir.mkdir(exist_ok=True)
+    pdf_path = temp_dir / f"temp_{file.filename}"
+    
     try:
+        with open(pdf_path, "wb") as f:
+            content = await file.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB.")
+            f.write(content)
+
+        logger.info(f"📄 Saved uploaded file: {len(content)} bytes, type: {file_extension}")
+
         # Extract text & detect sections
         lines = extract_document_text(pdf_path, file_extension)
-        print(f"📝 Extracted {len(lines)} lines from document")
+        logger.info(f"📝 Extracted {len(lines)} lines from document")
 
         analysis = extract_sections_with_targets(lines, target_sections, chapter)
         add_relevance(analysis)
@@ -1034,18 +1070,21 @@ async def analyze_pdf(
             }
         }
 
-        print(f"✅ Completed analysis for {chapter}: {present_count}/{total} enabled sections found")
+        logger.info(f"✅ Completed analysis for {chapter}: {present_count}/{total} enabled sections found")
         return response
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"❌ Error analyzing document: {e}")
-        return {"error": str(e), "status": "error"}
-
+        logger.error(f"Error analyzing document: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     finally:
+        # Clean up temporary file
         try:
-            pdf_path.unlink()
-        except:
-            pass
+            if pdf_path.exists():
+                pdf_path.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to delete temporary file: {e}")
 
 @app.get("/available-sections")
 async def get_available_sections(chapter: str = Query("Chapter 1", description="Get sections for specific chapter")):
@@ -1073,13 +1112,49 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    tokenizer, _, _, _, _ = get_models()
+    """Health check endpoint"""
+    try:
+        tokenizer, _, _, _, _ = get_models()
+        return {
+            "status": "healthy", 
+            "model_loaded": tokenizer is not None,
+            "supported_formats": list(SUPPORTED_EXTENSIONS),
+            "device": _device if _device else "unknown"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Service unhealthy: {str(e)}")
+
+@app.get("/model-info")
+async def model_info():
+    """Get information about the loaded models"""
+    tokenizer, model, embed_model, _, device = get_models()
     return {
-        "status": "healthy", 
-        "model_loaded": tokenizer is not None,
-        "supported_formats": ["PDF", "DOCX", "DOC"]
+        "flan_t5_model": MODEL_NAME,
+        "embedding_model": EMBED_MODEL_NAME,
+        "device": device,
+        "tokenizer_loaded": tokenizer is not None,
+        "model_loaded": model is not None,
+        "embedding_model_loaded": embed_model is not None
     }
+
+# ====================
+# Application Startup
+# ====================
+@app.on_event("startup")
+async def startup_event():
+    """Preload models on startup for faster first response"""
+    logger.info("🚀 Starting ThesisTrack API...")
+    try:
+        get_models()
+        logger.info("✅ Models preloaded successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to preload models: {e}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0",  # Listen on all interfaces
+        port=int(os.getenv("PORT", 8000)),  # Render provides PORT environment variable
+        log_level="info"
+    )
